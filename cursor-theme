@@ -216,11 +216,13 @@ apply_user() {
     if [ -f "$f" ]; then
         ini_set "$f" input cursor_theme "$t" ' = '; ini_set "$f" input cursor_size "$s" ' = '; ok "wayfire: wayfire.ini [input]"
     fi
-    f=$CFG/labwc/environment
-    if [ -f "$f" ]; then
+    # labwc: your own config dir, plus the private one Xfce's Wayland session starts labwc with
+    # (startxfce4 --wayland uses --config-dir ~/.config/xfce4/labwc and ignores ~/.config/labwc)
+    for f in "$CFG/labwc/environment" "$CFG/xfce4/labwc/environment"; do
+        [ -f "$f" ] || continue
         line_set "$f" '^[[:space:]]*XCURSOR_THEME=' "XCURSOR_THEME=$t"
-        line_set "$f" '^[[:space:]]*XCURSOR_SIZE='  "XCURSOR_SIZE=$s"; ok "labwc: environment"
-    fi
+        line_set "$f" '^[[:space:]]*XCURSOR_SIZE='  "XCURSOR_SIZE=$s"; ok "labwc: $(tilde "$f")"
+    done
     local envre='^[[:space:]]*env[[:space:]]*=[[:space:]]*(XCURSOR|HYPRCURSOR)_'
     for f in "$CFG"/mango/*.conf "$CFG"/hypr/*.conf "$CFG"/sway/config "$CFG"/niri/config.kdl; do
         [ -f "$f" ] || continue
@@ -383,7 +385,7 @@ cmd_status() {
         chk "xfce xsettings" "$(sed -n 's/.*name="CursorThemeName"[^>]*value="\([^"]*\)".*/\1/p' "$CFG/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml" | head -n1)"
     say "-- compositor / greeter configs that name a cursor"
     chk "wayfire.ini"     "$(ini_get "$CFG/wayfire.ini" input cursor_theme)"
-    local -a dirs=(); for f in hypr mango niri sway labwc river; do [ -d "$CFG/$f" ] && dirs+=("$CFG/$f"); done
+    local -a dirs=(); for f in hypr mango niri sway labwc xfce4/labwc river; do [ -d "$CFG/$f" ] && dirs+=("$CFG/$f"); done
     if [ "${#dirs[@]}" -gt 0 ]; then
         while IFS= read -r line; do
             if [[ $line =~ (^|[^A-Za-z0-9._+-])"$t"([^A-Za-z0-9._+-]|$) ]]; then ok "$(tilde "$line")"; else bad "$(tilde "$line")"; fi

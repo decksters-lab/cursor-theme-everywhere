@@ -64,7 +64,7 @@ your settings.
 | Xfce | xfconf `xsettings` channel (`/Gtk/CursorThemeName`, `/Gtk/CursorThemeSize`): live through `xfconf-query` while `xfsettingsd` runs, otherwise `xsettings.xml` is edited directly |
 | X11 / xsettingsd | `~/.Xresources`, `xsettingsd.conf` (only if present) |
 | Wayfire | `~/.config/wayfire.ini` `[input]` |
-| labwc | `~/.config/labwc/environment` |
+| labwc | `~/.config/labwc/environment`, and `~/.config/xfce4/labwc/environment` (the private copy Xfce's Wayland session starts labwc with) |
 | Hyprland (`.conf`), MangoWM, sway, niri | rewritten **only** where the config already pins a cursor |
 
 Compositor configs are deliberately not touched unless they already name a cursor. The
@@ -128,6 +128,11 @@ cursor setting to every GTK/X client and overrides `settings.ini`, so setting on
 files has no visible effect there. `cursor-theme` updates the xfconf values; if you ran
 `set` from another session, run `cursor-theme sync` inside Xfce or log out and back in.
 `status` shows an `xfce xsettings` line when an Xfce config exists.
+
+**Xfce's Wayland session ignores the theme.** `startxfce4 --wayland` runs labwc with its own
+config directory, `~/.config/xfce4/labwc`, and never reads `~/.config/labwc`. That directory's
+`environment` file ships with `XCURSOR_THEME=Adwaita`. `cursor-theme` updates it (theme and size)
+when it exists; log out and back in to the Xfce Wayland session afterwards.
 
 **Greeter shows `(dir not readable as you)` in `status`.** That is expected; the greeter's
 state directory is usually readable only by the greeter user. Check with
