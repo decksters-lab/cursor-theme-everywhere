@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# cursor-theme — one cursor theme, every desktop, compositor and greeter.
+#
+#   cursor-theme                  pick from installed themes, apply
+#   cursor-theme set NAME [SIZE]  apply (NAME alone also works)
+#   cursor-theme sync             re-apply saved theme, user files only, no root
+#   cursor-theme status [NAME]    audit every consumer against NAME (or the saved theme)
+#   cursor-theme list             installed cursor themes
+#
+# Model
+#   state    ~/.config/cursor-theme/state is the single source of truth.
+#   system   (one sudo/doas prompt) theme copied into /usr/share/icons, the one
+#            dir every client and greeter searches by default, so no XCURSOR_PATH
+#            games; /usr/share/icons/default -> NAME; /etc/environment (XCURSOR_*
+#            and HYPRCURSOR_*); greeter config for greeters that have one.
+#   user     ~/.local/share/icons/default, GTK 2/3/4, gsettings (GNOME+Cinnamon),
+#            KDE kcminputrc, Xfce xfconf, xsettingsd, Xresources — plus Wayfire/labwc/mango/
+#            Hyprland/sway/niri configs, but ONLY where they already pin a cursor.
+#   Nothing restarts greetd: a fresh greeter starts at your next logout, and
+#   restarting greetd from inside a session ends that session.
+#
+# Env: CT_ELEVATE=sudo|doas|pkexec forces the privilege tool (default: sudo, then doas).
+# First-touch backups: FILE.pre-cursor-theme (never overwritten, never piled up).
+set -uo pipefail
+shopt -s nullglob
+
+SELF=$(readlink -f "$0")
+SYS=${CT_SYS:-}                                   # test prefix; empty for real use
+SYS_ICONS=$SYS/usr/share/icons
+ENV_FILE=$SYS/etc/environment
+GREETER_TOML=$SYS/var/lib/noctalia-greeter/greeter.toml
+REGREET_TOML=$SYS/etc/greetd/regreet.toml
+MARK=.cursor-theme-managed
+CFG=${XDG_CONFIG_HOME:-$HOME/.config}
+DATA=${XDG_DATA_HOME:-$HOME/.local/share}
+STATE=$CFG/cursor-theme/state
+QUIET=0
+ICON_DIRS=("$DATA/icons" "$HOME/.icons" "$SYS/usr/local/share/icons" "$SYS_ICONS")
+
+# ---------- output ----------
+if [ -t 1 ]; then R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' D=$'\e[2m' Z=$'\e[0m'; else R= G= Y= D= Z=; fi
+BAD=0
+say()  { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
+ok()   { [ "$QUIET" -eq 1 ] || printf '  %s✓%s %s\n' "$G" "$Z" "$*"; }
+warn() { printf '  %s!%s %s\n' "$Y" "$Z" "$*" >&2; }
+bad()  { printf '  %s✗%s %s\n' "$R" "$Z" "$*"; BAD=$((BAD+1)); }
+dim()  { [ "$QUIET" -eq 1 ] || printf '  %s%s%s\n' "$D" "$*" "$Z"; }
+die()  { printf 'cursor-theme: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+tilde() { printf '%s' "${1/#$HOME/\~}"; }
+
+# ---------- file primitives (all idempotent, all preserve owner/mode) ----------
+backup() { [ -s "$1" ] && [ ! -e "$1.pre-cursor-theme" ] && cp -p "$1" "$1.pre-cursor-theme"; return 0; }
+
+commit() { # tmp dest — write through only if content changed
+    local tmp=$1 f=$2
+    if [ -e "$f" ] && cmp -s "$tmp" "$f"; then rm -f "$tmp"; return 0; fi
+    backup "$f"
+    mkdir -p "$(dirname "$f")"
+    cat "$tmp" >"$f"; rm -f "$tmp"
+}
+
+ini_get() { # file section key
+    [ -f "$1" ] || return 0
+    awk -v sec="$2" -v key="$3" '
+        /^[[:space:]]*\[[^]]*\]/ { n=$0; sub(/^[[:space:]]*\[/,"",n); sub(/\].*$/,"",n); insec=(n==sec); next }
+        insec && /=/ { k=$0; sub(/^[[:space:]]*/,"",k); sub(/[[:space:]]*=.*/,"",k)
+                       if (k==key) { v=$0; sub(/^[^=]*=[[:space:]]*/,"",v); gsub(/^"|"$/,"",v); print v; exit } }' "$1"
+}
+
+ini_set() { # file section key value [sep]
+    local f=$1 sec=$2 key=$3 val=$4 sep=${5:-=} tmp; tmp=$(mktemp)
+    mkdir -p "$(dirname "$f")"; [ -f "$f" ] || : >"$f"
+    awk -v sec="$sec" -v key="$key" -v val="$val" -v sep="$sep" '
+        function flush() { if (insec && !done) { print key sep val; done=1 } printf "%s", pend; pend="" }
+        /^[[:space:]]*\[[^]]*\]/ { flush(); n=$0; sub(/^[[:space:]]*\[/,"",n); sub(/\].*$/,"",n)
+                                   insec=(n==sec); if (insec) seen=1 }
+        insec && !done && /=/ { k=$0; sub(/^[[:space:]]*/,"",k); sub(/[[:space:]]*=.*/,"",k)
+                                if (k==key) { printf "%s", pend; pend=""; print key sep val; done=1; next } }
+        insec && !done && /^[[:space:]]*$/ { pend = pend $0 "\n"; next }
+        { printf "%s", pend; pend=""; print }
+        END { flush(); if (!seen) { if (NR) print ""; print "[" sec "]"; print key sep val } }' "$f" >"$tmp"
+    commit "$tmp" "$f"
+}
+
+line_set() { # file ERE newline — replace first match, else append
+    local f=$1 re=$2 new=$3 tmp; tmp=$(mktemp)
+    [ -f "$f" ] || : >"$f"
+    awk -v re="$re" -v new="$new" '!done && $0 ~ re { print new; done=1; next } { print } END { if (!done) print new }' "$f" >"$tmp"
+    commit "$tmp" "$f"
+}
+
+sed_commit() { # file sed-ERE-script — only touches files where it changes something
+    local f=$1 tmp; tmp=$(mktemp)
+    sed -E "$2" "$f" >"$tmp"; commit "$tmp" "$f"
+}
+
+xfce_xml_set() { # file property type value — edit xfconf's xsettings.xml when xfconfd isn't reachable
+    local f=$1 name=$2 type=$3 val=$4 have=0 tmp; tmp=$(mktemp)
+    grep -q "<property name=\"$name\"" "$f" && have=1
+    awk -v name="$name" -v type="$type" -v val="$val" -v have="$have" '
+        function ind(l) { match(l, /^[[:space:]]*/); return substr(l, 1, RLENGTH) }
+        function prop(i) { return i "<property name=\"" name "\" type=\"" type "\" value=\"" val "\"/>" }
+        { isgtk = ($0 ~ /<property name="Gtk" type="empty">/); if (isgtk) seengtk = 1 }
+        index($0, "<property name=\"" name "\"") { print prop(ind($0)); next }
+        !have && !done && !seengtk && /<\/channel>/ { i = ind($0); print i "  <property name=\"Gtk\" type=\"empty\">"; print prop(i "    "); print i "  </property>"; done = 1 }
+        !have && !done && isgtk { print; print prop(ind($0) "  "); done = 1; next }
+        { print }' "$f" >"$tmp"
+    commit "$tmp" "$f"
+}
+
+# ---------- themes ----------
+find_theme() { # name -> dir containing NAME/cursors
+    local d
+    for d in "${ICON_DIRS[@]}"; do [ -d "$d/$1/cursors" ] && { printf '%s\n' "$d"; return 0; }; done
+    return 1
+}
+
+list_themes() {
+    local d t
+    for d in "${ICON_DIRS[@]}"; do for t in "$d"/*/; do [ -d "${t}cursors" ] && basename "$t"; done; done | sort -u
+}
+
+theme_gaps() { # warn about missing core cursor names (toolkits ask for these)
+    local dir=$1 n miss=""
+    for n in default left_ptr text pointer; do [ -e "$dir/cursors/$n" ] || miss="$miss $n"; done
+    [ -z "$miss" ] && return 0
+    warn "$(basename "$dir") has no cursor(s):$miss — some apps will show the fallback arrow there"
+    case $miss in *" text"*) [ -e "$dir/cursors/xterm" ] && warn "fix: ln -s xterm '$dir/cursors/text'  (then re-run set to refresh the system copy)";; esac
+}
+
+valid_name() { [[ $1 =~ ^[A-Za-z0-9._+-]+$ ]]; }
+
+inherits_of() { sed -n 's/^[[:space:]]*Inherits[[:space:]]*=[[:space:]]*//p' "$1/index.theme" 2>/dev/null | head -n1 | tr -d '\r"' | tr ',' ' '; }
+
+# ---------- state ----------
+load_state() { THEME=; SIZE=; [ -f "$STATE" ] && . "$STATE"; return 0; }
+save_state() { mkdir -p "$(dirname "$STATE")"; printf 'THEME=%s\nSIZE=%s\n' "$1" "$2" >"$STATE"; }
+
+# ======================= USER LAYER (no root) =======================
+apply_user() {
+    local t=$1 s=$2 f d tmp
+
+    # 1. the XDG 'default' cursor theme: what every client falls back to
+    for d in "$DATA/icons/default" "$HOME/.icons/default"; do
+        [ "$d" = "$HOME/.icons/default" ] && [ ! -d "$d" ] && continue
+        tmp=$(mktemp); printf '[Icon Theme]\nName=Default\nComment=Default cursor theme\nInherits=%s\n' "$t" >"$tmp"
+        mkdir -p "$d"; commit "$tmp" "$d/index.theme"; ok "default -> $t  ($d)"
+    done
+
+    # 2. GTK 3 / 4
+    for f in "$CFG/gtk-3.0/settings.ini" "$CFG/gtk-4.0/settings.ini"; do
+        ini_set "$f" Settings gtk-cursor-theme-name "$t"
+        ini_set "$f" Settings gtk-cursor-theme-size "$s"
+        ok "gtk: $(tilde "$f")"
+    done
+    # GTK 2, Xresources, xsettingsd: only if you use them
+    if [ -f "$HOME/.gtkrc-2.0" ]; then
+        line_set "$HOME/.gtkrc-2.0" '^[[:space:]]*gtk-cursor-theme-name' "gtk-cursor-theme-name=\"$t\""
+        line_set "$HOME/.gtkrc-2.0" '^[[:space:]]*gtk-cursor-theme-size' "gtk-cursor-theme-size=$s"
+        ok "gtk2: ~/.gtkrc-2.0"
+    fi
+    for f in "$HOME/.Xresources" "$CFG/Xresources"; do
+        [ -f "$f" ] || continue
+        line_set "$f" '^[[:space:]]*Xcursor[.]theme:' "Xcursor.theme: $t"
+        line_set "$f" '^[[:space:]]*Xcursor[.]size:'  "Xcursor.size: $s"
+        ok "Xresources: $(tilde "$f")"
+        [ -n "${DISPLAY:-}" ] && have xrdb && xrdb -merge "$f" 2>/dev/null
+    done
+    f=$CFG/xsettingsd/xsettingsd.conf
+    if [ -f "$f" ]; then
+        line_set "$f" '^[[:space:]]*Gtk/CursorThemeName' "Gtk/CursorThemeName \"$t\""
+        line_set "$f" '^[[:space:]]*Gtk/CursorThemeSize' "Gtk/CursorThemeSize $s"
+        pkill -HUP -x xsettingsd 2>/dev/null
+        ok "xsettingsd: ~/.config/xsettingsd/xsettingsd.conf"
+    fi
+
+    # 3. dconf (GNOME-family + Cinnamon); falls back to a throwaway bus with no session
+    if have gsettings; then
+        local schemas sch done_any=0; schemas=$(gsettings list-schemas 2>/dev/null)
+        for sch in org.gnome.desktop.interface org.cinnamon.desktop.interface; do
+            grep -qx "$sch" <<<"$schemas" || continue
+            if gsettings set "$sch" cursor-theme "$t" 2>/dev/null && gsettings set "$sch" cursor-size "$s" 2>/dev/null; then :
+            elif have dbus-run-session && dbus-run-session -- sh -c "gsettings set $sch cursor-theme '$t' && gsettings set $sch cursor-size $s" >/dev/null 2>&1; then :
+            else warn "gsettings $sch: could not write (run 'cursor-theme sync' inside your session)"; continue; fi
+            ok "dconf: $sch"; done_any=1
+        done
+        [ "$done_any" -eq 1 ] || dim "dconf: no GNOME/Cinnamon schemas installed"
+    fi
+
+    # 4. KDE Plasma
+    local kw=; have kwriteconfig6 && kw=kwriteconfig6; [ -z "$kw" ] && have kwriteconfig5 && kw=kwriteconfig5
+    if [ -n "$kw" ]; then
+        "$kw" --file kcminputrc --group Mouse --key cursorTheme "$t"
+        "$kw" --file kcminputrc --group Mouse --key cursorSize "$s"
+        have plasma-apply-cursortheme && pgrep -x plasmashell >/dev/null 2>&1 && plasma-apply-cursortheme "$t" >/dev/null 2>&1
+        ok "kde: kcminputrc"
+    fi
+
+    # 4b. Xfce: xfsettingsd publishes /Gtk/CursorThemeName from xfconf to every GTK/X client
+    #     and overrides settings.ini, so this is the setting that matters there.
+    local xfx=$CFG/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml
+    if have xfconf-query && pgrep -x xfsettingsd >/dev/null 2>&1; then
+        if xfconf-query -c xsettings -p /Gtk/CursorThemeName -n -t string -s "$t" 2>/dev/null \
+           && xfconf-query -c xsettings -p /Gtk/CursorThemeSize -n -t int -s "$s" 2>/dev/null; then
+            ok "xfce: xfconf xsettings (live)"
+        else warn "xfce: xfconf-query failed; run 'cursor-theme sync' inside the Xfce session"; fi
+    elif [ -f "$xfx" ]; then
+        xfce_xml_set "$xfx" CursorThemeName string "$t"
+        xfce_xml_set "$xfx" CursorThemeSize int "$s"
+        ok "xfce: $(tilde "$xfx") (applies at next Xfce login)"
+    fi
+
+    # 5. compositors: edit only configs that already pin a cursor (never invent keys elsewhere)
+    f=$CFG/wayfire.ini
+    if [ -f "$f" ]; then
+        ini_set "$f" input cursor_theme "$t" ' = '; ini_set "$f" input cursor_size "$s" ' = '; ok "wayfire: wayfire.ini [input]"
+    fi
+    f=$CFG/labwc/environment
+    if [ -f "$f" ]; then
+        line_set "$f" '^[[:space:]]*XCURSOR_THEME=' "XCURSOR_THEME=$t"
+        line_set "$f" '^[[:space:]]*XCURSOR_SIZE='  "XCURSOR_SIZE=$s"; ok "labwc: environment"
+    fi
+    local envre='^[[:space:]]*env[[:space:]]*=[[:space:]]*(XCURSOR|HYPRCURSOR)_'
+    for f in "$CFG"/mango/*.conf "$CFG"/hypr/*.conf "$CFG"/sway/config "$CFG"/niri/config.kdl; do
+        [ -f "$f" ] || continue
+        grep -qE "${envre}(THEME|SIZE)|hyprctl[[:space:]]+setcursor|xcursor[_-](theme|size)" "$f" || continue
+        sed_commit "$f" "
+            s@(${envre#^}(THEME)[[:space:]]*,[[:space:]]*)[^[:space:]#]+@\\1$t@
+            s@(${envre#^}(SIZE)[[:space:]]*,[[:space:]]*)[0-9]+@\\1$s@
+            s@(hyprctl[[:space:]]+setcursor[[:space:]]+)[^[:space:]]+[[:space:]]+[0-9]+@\\1$t $s@
+            s@^([[:space:]]*seat[[:space:]]+[^[:space:]]+[[:space:]]+xcursor_theme[[:space:]]+)[^[:space:]]+([[:space:]]+[0-9]+)?@\\1$t $s@
+            s@^([[:space:]]*xcursor-theme[[:space:]]+)\"[^\"]*\"@\\1\"$t\"@
+            s@^([[:space:]]*xcursor-size[[:space:]]+)[0-9]+@\\1$s@"
+        ok "compositor pin: $(tilde "$f")"
+    done
+    # Hyprland's Lua config (or anything else) I can't rewrite safely: just point at it
+    grep -nE 'XCURSOR_(THEME|SIZE)|HYPRCURSOR_(THEME|SIZE)|setcursor' "$CFG"/hypr/*.lua 2>/dev/null \
+        | sed "s@^@  ${Y}!${Z} edit by hand: $(tilde "$CFG")/hypr/@" >&2
+
+    # 6. live apply where a compositor can do it without a restart
+    [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && have hyprctl && hyprctl setcursor "$t" "$s" >/dev/null 2>&1
+    [ -n "${SWAYSOCK:-}" ] && have swaymsg && swaymsg "seat * xcursor_theme $t $s" >/dev/null 2>&1
+    return 0
+}
+
+# ======================= SYSTEM LAYER (root) =======================
+install_sys_theme() { # name srcparentdir [depth]
+    local name=$1 parent=$2 depth=${3:-0} dst p pd; dst=$SYS_ICONS/$name
+    [ "$depth" -gt 4 ] && return 0
+    if [ "$parent" = "$SYS_ICONS" ]; then ok "$name already in /usr/share/icons"
+    elif [ -d "$dst" ] && [ ! -e "$dst/$MARK" ]; then ok "$dst exists and is not ours (package?), leaving it"
+    else
+        rm -rf "$dst"; mkdir -p "$SYS_ICONS"; cp -rL "$parent/$name" "$dst"
+        chmod -R a+rX,go-w "$dst"; chown -R root:root "$dst" 2>/dev/null; : >"$dst/$MARK"
+        ok "copied $name -> /usr/share/icons/$name"
+    fi
+    for p in $(inherits_of "$parent/$name"); do   # parents living only in $HOME would break too
+        [ -d "$SYS_ICONS/$p/cursors" ] && continue
+        pd=$(find_theme "$p") && [ "$pd" != "$SYS_ICONS" ] && install_sys_theme "$p" "$pd" $((depth+1))
+    done
+}
+
+apply_system() { # theme size srcparent
+    local t=$1 s=$2 src=$3 tmp f
+    install_sys_theme "$t" "$src"
+
+    mkdir -p "$SYS_ICONS/default"
+    tmp=$(mktemp); printf '[Icon Theme]\nName=Default\nComment=Default cursor theme\nInherits=%s\n' "$t" >"$tmp"
+    commit "$tmp" "$SYS_ICONS/default/index.theme"; chmod a+r "$SYS_ICONS/default/index.theme"
+    ok "system default -> $t"
+    if have pacman && [ -z "$SYS" ] && pacman -Qo "$SYS_ICONS/default/index.theme" >/dev/null 2>&1; then
+        warn "default/index.theme is owned by a package; an upgrade may revert it — re-run 'cursor-theme set' after"
+    fi
+
+    line_set "$ENV_FILE" '^[[:space:]]*XCURSOR_THEME=' "XCURSOR_THEME=$t"
+    line_set "$ENV_FILE" '^[[:space:]]*XCURSOR_SIZE='  "XCURSOR_SIZE=$s"
+    # Hyprland prefers hyprcursor; with these unset it can draw a different theme than xcursor
+    line_set "$ENV_FILE" '^[[:space:]]*HYPRCURSOR_THEME=' "HYPRCURSOR_THEME=$t"
+    line_set "$ENV_FILE" '^[[:space:]]*HYPRCURSOR_SIZE='  "HYPRCURSOR_SIZE=$s"
+    ok "/etc/environment (next login)"
+
+    if [ -d "$(dirname "$GREETER_TOML")" ]; then
+        local new=0; [ -f "$GREETER_TOML" ] || new=1
+        ini_set "$GREETER_TOML" cursor theme "\"$t\"" ' = '
+        ini_set "$GREETER_TOML" cursor size "$s" ' = '
+        [ "$new" -eq 1 ] && chown --reference="$(dirname "$GREETER_TOML")" "$GREETER_TOML" 2>/dev/null
+        [ "$(grep -c '^[[:space:]]*\[cursor\]' "$GREETER_TOML")" -gt 1 ] && warn "greeter.toml has duplicate [cursor] tables — greeter ignores the file; fix by hand"
+        ok "noctalia-greeter: greeter.toml [cursor]"
+    fi
+    if [ -f "$REGREET_TOML" ]; then   # key name from regreet's docs as I know them; skipped if you don't use it
+        ini_set "$REGREET_TOML" GTK cursor_theme_name "\"$t\"" ' = '; ok "regreet: regreet.toml [GTK]"
+    fi
+    return 0
+}
+
+elev_cmd() { # CT_ELEVATE forces one; otherwise sudo, then doas
+    local c=${CT_ELEVATE:-}
+    [ -n "$c" ] && { have "$c" && printf '%s\n' "$c"; return; }
+    for c in sudo doas; do have "$c" && { printf '%s\n' "$c"; return; }; done
+    return 1
+}
+
+elevate() {
+    local c
+    if [ "$(id -u)" -eq 0 ] || [ -n "$SYS" ]; then "$@"
+    elif c=$(elev_cmd); then "$c" "$@"
+    else return 127; fi
+}
+
+# ======================= COMMANDS =======================
+cmd_list() { list_themes; }
+
+cmd_set() {
+    local t=${1:-} s=${2:-} src
+    load_state; [ -n "$s" ] || s=${SIZE:-24}
+    if [ -z "$t" ]; then
+        local -a names; mapfile -t names < <(list_themes)
+        [ "${#names[@]}" -gt 0 ] || die "no cursor themes found (a theme dir must contain cursors/)"
+        local i; for i in "${!names[@]}"; do printf '  %2d) %s\n' $((i+1)) "${names[$i]}"; done
+        printf 'theme (number or name): '; read -r t
+        [[ $t =~ ^[0-9]+$ ]] && t=${names[$((t-1))]:-}
+    fi
+    valid_name "$t"      || die "bad theme name '$t'"
+    [[ $s =~ ^[0-9]+$ ]] && [ "$s" -ge 8 ] && [ "$s" -le 256 ] || die "bad size '$s' (8-256)"
+    src=$(find_theme "$t") || die "no cursor theme '$t' (case-sensitive; dir must contain cursors/). Try: cursor-theme list"
+    theme_gaps "$src/$t"
+
+    say "== $t @ $s =="
+    save_state "$t" "$s"
+    say "-- user"; apply_user "$t" "$s"
+    say "-- system"
+    if ! elevate bash "$SELF" _system "$t" "$s" "$src" "$(IFS=:; echo "${ICON_DIRS[*]}")"; then
+        warn "system part skipped (no sudo/doas, or auth failed) — greeter and other users won't follow. Re-run: cursor-theme set $t $s"
+    fi
+    say; say "Done. Log out and back in; the greeter picks it up on that logout (no greetd restart needed)."
+}
+
+cmd_sync() {
+    load_state; [ -n "${THEME:-}" ] || die "nothing saved yet — run: cursor-theme set NAME"
+    find_theme "$THEME" >/dev/null || die "saved theme '$THEME' is no longer installed"
+    apply_user "$THEME" "${SIZE:-24}"
+}
+
+cmd_status() {
+    load_state; local t=${1:-${THEME:-}} s=${SIZE:-24} v f line
+    [ -n "$t" ] || die "no saved theme; give one: cursor-theme status NAME"
+    chk() { # label actual [expected]
+        local exp=${3:-$t} act=${2//\"/}; act=${act//\'/}
+        if [ -z "$act" ]; then dim "$(printf '%-26s (unset)' "$1")"
+        elif [ "$act" = "$exp" ]; then ok "$(printf '%-26s %s' "$1" "$act")"
+        else bad "$(printf '%-26s %s   (want %s)' "$1" "$act" "$exp")"; fi
+    }
+    say "expected: $t @ $s"
+    say "-- theme"
+    local src; if src=$(find_theme "$t"); then ok "found in $src"; theme_gaps "$src/$t"; else bad "not installed anywhere"; fi
+    if [ -d "$SYS_ICONS/$t/cursors" ]; then
+        if [ -n "$(find "$SYS_ICONS/$t" \( -type d ! -perm -o+x -o ! -perm -o+r \) -print -quit)" ]; then
+            bad "/usr/share/icons/$t has entries 'other' can't read — greeter will fall back"
+        else ok "in /usr/share/icons, world-readable (greeter-safe)"; fi
+    else bad "not in /usr/share/icons — greeter and other users can't see it"; fi
+    say "-- fallbacks"
+    chk "system default"   "$(inherits_of "$SYS_ICONS/default")"
+    chk "user default"     "$(inherits_of "$DATA/icons/default")"
+    say "-- environment"
+    chk "/etc/environment"  "$(sed -n 's/^[[:space:]]*XCURSOR_THEME=//p' "$ENV_FILE" 2>/dev/null | tail -n1)"
+    chk "/etc/env HYPRCURSOR"  "$(sed -n 's/^[[:space:]]*HYPRCURSOR_THEME=//p' "$ENV_FILE" 2>/dev/null | tail -n1)"
+    v=$(sed -n 's/^[[:space:]]*XCURSOR_PATH=//p' "$ENV_FILE" 2>/dev/null | tail -n1)
+    [ -z "$v" ] || { case ":${v//\"/}:" in *:/usr/share/icons:*) dim "XCURSOR_PATH=$v";; *) bad "XCURSOR_PATH=$v lacks /usr/share/icons (overrides the default search path)";; esac; }
+    [ "${XCURSOR_THEME:-}" = "$t" ] || warn "this shell has XCURSOR_THEME=${XCURSOR_THEME:-(unset)} — normal until you log in again"
+    say "-- toolkits"
+    chk "gtk-3.0"      "$(ini_get "$CFG/gtk-3.0/settings.ini" Settings gtk-cursor-theme-name)"
+    chk "gtk-4.0"      "$(ini_get "$CFG/gtk-4.0/settings.ini" Settings gtk-cursor-theme-name)"
+    chk "gtk2"         "$(sed -n 's/^[[:space:]]*gtk-cursor-theme-name[[:space:]]*=[[:space:]]*//p' "$HOME/.gtkrc-2.0" 2>/dev/null | head -n1)"
+    chk "xsettingsd"   "$(sed -n 's/^[[:space:]]*Gtk\/CursorThemeName[[:space:]]*//p' "$CFG/xsettingsd/xsettingsd.conf" 2>/dev/null | head -n1)"
+    chk "Xresources"   "$(sed -n 's/^[[:space:]]*Xcursor\.theme:[[:space:]]*//p' "$HOME/.Xresources" 2>/dev/null | head -n1)"
+    if have gsettings; then
+        chk "dconf gnome"    "$(gsettings get org.gnome.desktop.interface cursor-theme 2>/dev/null)"
+        chk "dconf cinnamon" "$(gsettings get org.cinnamon.desktop.interface cursor-theme 2>/dev/null)"
+    fi
+    chk "kde kcminputrc"  "$(ini_get "$CFG/kcminputrc" Mouse cursorTheme)"
+    [ -f "$CFG/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml" ] && \
+        chk "xfce xsettings" "$(sed -n 's/.*name="CursorThemeName"[^>]*value="\([^"]*\)".*/\1/p' "$CFG/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml" | head -n1)"
+    say "-- compositor / greeter configs that name a cursor"
+    chk "wayfire.ini"     "$(ini_get "$CFG/wayfire.ini" input cursor_theme)"
+    local -a dirs=(); for f in hypr mango niri sway labwc river; do [ -d "$CFG/$f" ] && dirs+=("$CFG/$f"); done
+    if [ "${#dirs[@]}" -gt 0 ]; then
+        while IFS= read -r line; do
+            if [[ $line =~ (^|[^A-Za-z0-9._+-])"$t"([^A-Za-z0-9._+-]|$) ]]; then ok "$(tilde "$line")"; else bad "$(tilde "$line")"; fi
+        done < <(grep -rnIE '(XCURSOR|HYPRCURSOR)_THEME["'\'']?[[:space:]]*[=,]|xcursor[_-]theme[[:space:]]|setcursor[[:space:]]' --exclude='*.pre-cursor-theme' "${dirs[@]}" 2>/dev/null | cut -c1-140)
+    fi
+    if [ -d "$(dirname "$GREETER_TOML")" ] && [ ! -r "$GREETER_TOML" ]; then
+        dim "noctalia greeter        (dir not readable as you; check: $(elev_cmd || echo sudo) grep -A3 '^\[cursor\]' /var/lib/noctalia-greeter/greeter.toml)"
+    else chk "noctalia greeter" "$(ini_get "$GREETER_TOML" cursor theme)"; fi
+    chk "regreet"          "$(ini_get "$REGREET_TOML" GTK cursor_theme_name)"
+    say
+    if [ "$BAD" -eq 0 ]; then printf '%sAll consistent.%s\n' "$G" "$Z"; else printf '%s%d mismatch(es).%s Fix: cursor-theme set %s %s\n' "$R" "$BAD" "$Z" "$t" "$s"; fi
+    [ "$BAD" -eq 0 ]
+}
+
+# ---------- dispatch ----------
+case ${1:-} in
+    -h|--help|help) sed -n '2,/^set -uo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
+    list|-l|--list) cmd_list ;;
+    status|doctor)  shift; cmd_status "$@" ;;
+    sync)           shift; [ "${1:-}" = "--quiet" ] && QUIET=1; cmd_sync ;;
+    _system)        shift; IFS=: read -ra ICON_DIRS <<<"$4"; [ "$(id -u)" -eq 0 ] || [ -n "$SYS" ] || die "internal"
+                    valid_name "$1" || die "bad name"; apply_system "$1" "$2" "$3" ;;
+    set)            shift; cmd_set "$@" ;;
+    *)              cmd_set "$@" ;;
+esac
