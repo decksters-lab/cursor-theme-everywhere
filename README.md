@@ -72,7 +72,7 @@ design is that a compositor with no pin follows `/etc/environment` and the `defa
 theme, which is how COSMIC and a Hyprland with no pin behave, and the tool does not
 invent keys in files it doesn't understand. If you pin the cursor in a format it can't
 rewrite (for example a Hyprland Lua config), `set` prints the lines to edit by hand and
-`status` flags them when they disagree.
+`status` flags them when they disagree. Note: I removed the cursor choice i previously had configured for wayfire,mango and hyprrland from wayfire.ini, mangowms .conf, and hyprland.lua on my own system.This allows /etc/environment to hold the variable for all 3 but this is not something you HAVE to do... it just eliminates the need to edit either of the 3 by hand. 
 
 When run inside Hyprland or sway it also applies the theme live (`hyprctl setcursor`,
 `swaymsg seat`).
